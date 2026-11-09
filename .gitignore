@@ -1,0 +1,7 @@
+/target
+crates/*/target
+**/*.rs.bk
+*.png
+*.wav
+*.out
+*.tmp

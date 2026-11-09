@@ -1,0 +1,25 @@
+[package]
+name = "stegoslop-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core steganography engine for StegoSlop (LSB in Audio and Images, Zero-Width Unicode)"
+license = "GPL-3.0"
+
+[dependencies]
+crc32fast = "1.4"
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
+hmac = "0.12"
+image = { version = "0.25", default-features = false, features = ["png"] }
+hound = "3.5"
+rand = "0.8"
+thiserror = "1.0"
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+default = []
+wasm = ["wasm-bindgen"]
+
+[dev-dependencies]
+tempfile = "3.10"

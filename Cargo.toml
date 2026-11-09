@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/stegoslop-core",
+    "crates/stegoslop-cli",
+]
+resolver = "2"
