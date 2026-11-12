@@ -1,14 +1,19 @@
-name: Build & Test
+name: Build, Test & Release StegoSlop CLI
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  build:
-    name: Build & Test StegoSlop CLI
+  test:
+    name: Run Unit & Integration Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -23,5 +28,97 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Build release binary
-        run: cargo build --release --verbose
+  build-cross:
+    name: Build (${{ matrix.arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: i686-unknown-linux-musl
+            arch: x86
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross prebuilt binary
+        run: |
+          curl -sL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/cross
+
+      - name: Extract Version
+        id: get_version
+        run: |
+          VERSION=$(grep '^version = ' crates/stegoslop-cli/Cargo.toml | head -n1 | cut -d '"' -f 2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build Binary with Cross
+        run: cross build --release --target ${{ matrix.target }} --bin stegoslop
+
+      - name: Package Binary & Checksum
+        run: |
+          mkdir -p dist
+          BIN="target/${{ matrix.target }}/release/stegoslop"
+          ARCHIVE="stegoslop-v${{ env.VERSION }}-${{ matrix.arch }}-linux-musl.tar.gz"
+          tar -czvf "dist/$ARCHIVE" -C "target/${{ matrix.target }}/release" stegoslop
+          cd dist && sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stegoslop-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Release Assets
+    needs: build-cross
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Version
+        id: get_version
+        run: |
+          VERSION=$(grep '^version = ' crates/stegoslop-cli/Cargo.toml | head -n1 | cut -d '"' -f 2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.VERSION) }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('StegoSlop CLI v{0}', env.VERSION) }}
+          body: |
+            ### StegoSlop CLI v${{ env.VERSION }}
+            High-performance multi-carrier steganography CLI built in Rust.
+            
+            - **Commit:** `${{ github.sha }}`
+            - **Architectures:**
+              - `x86_64` (Linux 64-bit musl static binary)
+              - `x86` (Linux 32-bit musl static binary)
+              - `aarch64` (Linux ARM64 musl static binary)
+            - **Features:** LSB in PNG images & 16-bit PCM WAV audio, Zero-Width Unicode, AES-256-GCM encryption, CRC32 verification, and bit-plane forensic analysis.
+          prerelease: false
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.sha256
