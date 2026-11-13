@@ -166,12 +166,38 @@ pub fn embed_robust_in_rgba(
     Ok(())
 }
 
+pub struct RobustExtraction {
+    pub data: Vec<u8>,
+    pub is_encrypted: bool,
+    pub is_corrupted: bool,
+}
+
 pub fn extract_robust_from_rgba(
     rgba: &[u8],
     width: u32,
     height: u32,
     password: Option<&str>,
 ) -> Result<Vec<u8>> {
+    let res = extract_robust_from_rgba_ext(rgba, width, height, password, false)?;
+    Ok(res.data)
+}
+
+pub fn extract_robust_from_rgba_forced(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    password: Option<&str>,
+) -> Result<RobustExtraction> {
+    extract_robust_from_rgba_ext(rgba, width, height, password, true)
+}
+
+fn extract_robust_from_rgba_ext(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    password: Option<&str>,
+    forced: bool,
+) -> Result<RobustExtraction> {
     let expected_len = (width as usize) * (height as usize) * 4;
     if rgba.len() != expected_len {
         return Err(StegoError::InvalidImage(format!(
@@ -278,7 +304,8 @@ pub fn extract_robust_from_rgba(
     actual_crc_hasher.update(&raw_payload);
     let actual_crc = actual_crc_hasher.finalize();
 
-    if actual_crc != expected_crc {
+    let is_corrupted = actual_crc != expected_crc;
+    if is_corrupted && !forced {
         return Err(StegoError::CrcMismatch {
             expected: expected_crc,
             actual: actual_crc,
@@ -286,7 +313,8 @@ pub fn extract_robust_from_rgba(
     }
 
     // Handle decryption if encrypted
-    if (flags & FLAG_ENCRYPTED) != 0 {
+    let is_encrypted = (flags & FLAG_ENCRYPTED) != 0;
+    let data = if is_encrypted {
         let pwd = password
             .filter(|s| !s.is_empty())
             .ok_or(StegoError::PasswordRequired)?;
@@ -299,15 +327,24 @@ pub fn extract_robust_from_rgba(
         let iv = &raw_payload[crypto::SALT_LENGTH..crypto::SALT_LENGTH + crypto::IV_LENGTH];
         let ciphertext = &raw_payload[crypto::SALT_LENGTH + crypto::IV_LENGTH..];
 
-        crypto::decrypt(ciphertext, pwd, salt, iv)
+        crypto::decrypt(ciphertext, pwd, salt, iv)?
     } else {
-        Ok(raw_payload)
-    }
+        raw_payload
+    };
+
+    Ok(RobustExtraction {
+        data,
+        is_encrypted,
+        is_corrupted,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ImageEncoder;
 
     #[test]
     fn test_robust_roundtrip_unencrypted() {
@@ -338,14 +375,17 @@ mod tests {
         )
         .unwrap();
 
-        // Extract with wrong password -> must fail
-        assert!(extract_robust_from_rgba(
-            &rgba,
-            width as u32,
-            height as u32,
-            Some("wrong_pass")
-        )
-        .is_err());
+        // Extract with no password -> must fail with PasswordRequired
+        match extract_robust_from_rgba(&rgba, width as u32, height as u32, None) {
+            Err(StegoError::PasswordRequired) => {},
+            other => panic!("Expected PasswordRequired, got {:?}", other),
+        }
+
+        // Extract with wrong password -> must fail with DecryptionFailed
+        match extract_robust_from_rgba(&rgba, width as u32, height as u32, Some("wrong_pass")) {
+            Err(StegoError::DecryptionFailed) => {},
+            other => panic!("Expected DecryptionFailed, got {:?}", other),
+        }
 
         // Extract with correct password -> must match
         let extracted = extract_robust_from_rgba(
@@ -356,5 +396,134 @@ mod tests {
         )
         .unwrap();
         assert_eq!(extracted, secret);
+    }
+
+    #[test]
+    fn test_robust_capacity_calculations_and_bounds() {
+        // 64x64 -> 8x8 = 64 blocks (< 352 header blocks)
+        assert_eq!(compute_robust_capacity(64, 64, false), 0);
+        assert_eq!(compute_robust_capacity(64, 64, true), 0);
+
+        // 256x256 -> 32x32 = 1024 blocks.
+        // Avail bytes = (1024 - 352) / 8 = 672 / 8 = 84 bytes
+        assert_eq!(compute_robust_capacity(256, 256, false), 84);
+        // Encrypted: 84 - 44 = 40 bytes
+        assert_eq!(compute_robust_capacity(256, 256, true), 40);
+
+        // 512x512 -> 64x64 = 4096 blocks.
+        // Avail bytes = (4096 - 352) / 8 = 3744 / 8 = 468 bytes
+        assert_eq!(compute_robust_capacity(512, 512, false), 468);
+        assert_eq!(compute_robust_capacity(512, 512, true), 424);
+
+        // Overflow test: try to embed 100 bytes into a 256x256 image (capacity 84)
+        let mut rgba = vec![128u8; 256 * 256 * 4];
+        let oversized_secret = vec![0x42u8; 100];
+        match embed_robust_in_rgba(&mut rgba, 256, 256, &oversized_secret, None) {
+            Err(StegoError::CapacityExceeded { payload_size, capacity }) => {
+                assert_eq!(payload_size, 100);
+                assert_eq!(capacity, 84);
+            }
+            other => panic!("Expected CapacityExceeded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_robust_survives_real_jpeg_compression_quality_75() {
+        // Test survival across realistic lossy JPEG compression at quality 75 (Telegram standard)
+        let width = 512;
+        let height = 512;
+        let mut rgba = vec![0u8; width * height * 4];
+
+        // Synthesize a realistic image with gradients and textures
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * width + x) * 4;
+                let grad = ((x * 150 / width) + (y * 80 / height)) as u8;
+                let noise = ((x ^ y) & 0x1F) as u8;
+                rgba[offset] = grad.saturating_add(noise);
+                rgba[offset + 1] = grad.saturating_add(noise / 2);
+                rgba[offset + 2] = 180u8.saturating_sub(grad / 2);
+                rgba[offset + 3] = 255;
+            }
+        }
+
+        let secret = b"Ea-nasir: you sent me ingots of bad copper in my yard! WARFARE 2026";
+        embed_robust_in_rgba(&mut rgba, width as u32, height as u32, secret, None).unwrap();
+
+        // Convert RGBA to RGB for JPEG encoding
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for chunk in rgba.chunks_exact(4) {
+            rgb.push(chunk[0]);
+            rgb.push(chunk[1]);
+            rgb.push(chunk[2]);
+        }
+
+        // Encode to lossy JPEG at quality 75 (simulating Telegram's transcode)
+        let mut jpeg_buf = Cursor::new(Vec::new());
+        let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 75);
+        encoder
+            .write_image(&rgb, width as u32, height as u32, image::ExtendedColorType::Rgb8)
+            .unwrap();
+
+        let jpeg_bytes = jpeg_buf.into_inner();
+        assert!(!jpeg_bytes.is_empty());
+
+        // Decode JPEG back to RGBA
+        let decoded_img = image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg)
+            .unwrap()
+            .to_rgba8();
+
+        let decoded_raw = decoded_img.into_raw();
+
+        // Extract secret from the lossy JPEG!
+        let extracted = extract_robust_from_rgba(&decoded_raw, width as u32, height as u32, None)
+            .expect("Extraction from lossy JPEG quality 75 failed");
+
+        assert_eq!(extracted, secret, "Extracted secret from JPEG did not match original!");
+    }
+
+    #[test]
+    fn test_robust_survives_aggressive_jpeg_quality_60() {
+        // Even at aggressive quality 60 (heavy compression artifacts)
+        let width = 512;
+        let height = 512;
+        let mut rgba = vec![120u8; width * height * 4];
+
+        let secret = b"Resistant to aggressive lossy quantization!";
+        embed_robust_in_rgba(&mut rgba, width as u32, height as u32, secret, None).unwrap();
+
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for chunk in rgba.chunks_exact(4) {
+            rgb.push(chunk[0]);
+            rgb.push(chunk[1]);
+            rgb.push(chunk[2]);
+        }
+
+        let mut jpeg_buf = Cursor::new(Vec::new());
+        let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 60);
+        encoder
+            .write_image(&rgb, width as u32, height as u32, image::ExtendedColorType::Rgb8)
+            .unwrap();
+
+        let jpeg_bytes = jpeg_buf.into_inner();
+        let decoded_img = image::load_from_memory(&jpeg_bytes).unwrap().to_rgba8();
+
+        let extracted = extract_robust_from_rgba(decoded_img.as_raw(), width as u32, height as u32, None)
+            .expect("Extraction from aggressive JPEG quality 60 failed");
+
+        assert_eq!(extracted, secret);
+    }
+
+    #[test]
+    fn test_robust_invalid_magic_on_unmarked_image() {
+        let width = 256;
+        let height = 256;
+        let clean_rgba = vec![128u8; width * height * 4];
+
+        // An image without RSLP stego must fail with InvalidRobustMagic
+        match extract_robust_from_rgba(&clean_rgba, width as u32, height as u32, None) {
+            Err(StegoError::InvalidRobustMagic) => {},
+            other => panic!("Expected InvalidRobustMagic on clean image, got {:?}", other),
+        }
     }
 }

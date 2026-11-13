@@ -17,6 +17,7 @@ pub use protocol::{
 };
 pub use robust::{
     compute_robust_capacity, embed_robust_in_rgba, extract_robust_from_rgba,
+    extract_robust_from_rgba_forced, RobustExtraction,
 };
 pub use zero_width::{
     decode as decode_zero_width, encode as encode_zero_width, has_hidden_data, strip_hidden_data,
