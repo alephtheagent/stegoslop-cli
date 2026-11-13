@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod error;
 pub mod image;
 pub mod protocol;
+pub mod robust;
 pub mod zero_width;
 
 pub use audio::{embed_in_wav, extract_from_wav, extract_raw_bits_from_wav, parse_wav, WavInfo};
@@ -13,6 +14,9 @@ pub use image::{
 };
 pub use protocol::{
     pack_payload, unpack_payload, unpack_payload_forced, PayloadType, UnpackedPayload,
+};
+pub use robust::{
+    compute_robust_capacity, embed_robust_in_rgba, extract_robust_from_rgba,
 };
 pub use zero_width::{
     decode as decode_zero_width, encode as encode_zero_width, has_hidden_data, strip_hidden_data,

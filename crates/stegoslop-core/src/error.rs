@@ -8,6 +8,9 @@ pub enum StegoError {
     #[error("Invalid magic bytes: expected 'SLOP'")]
     InvalidMagic,
 
+    #[error("Invalid robust magic bytes: expected 'RSLP'")]
+    InvalidRobustMagic,
+
     #[error("Unknown payload type code: {0}")]
     UnknownPayloadType(u8),
 
